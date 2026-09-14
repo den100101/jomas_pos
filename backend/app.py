@@ -1,7 +1,12 @@
 from datetime import datetime, timedelta
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_mail import Mail,Message
+
+
+load_dotenv()
 
 from config import Config
 from models import (
@@ -22,6 +27,7 @@ app = Flask(__name__)
 app.config.from_object(Config)
 CORS(app)
 db.init_app(app)
+mail = Mail(app)
 
 
 # ================= Auth (demo) =================
@@ -159,10 +165,38 @@ def update_order_status(order_id):
     return jsonify(order.to_dict())
 
 
+def build_receipt_email_body(order, settings):
+    """Plain-text receipt body used in the e-receipt email."""
+    lines = [
+        settings.store_name,
+        settings.receipt_header or "",
+        "",
+        f"Order #: {order.order_number}",
+        f"Date: {order.created_at.strftime('%Y-%m-%d %I:%M %p')}",
+        f"Payment: {order.payment_method.upper()}",
+        "",
+        "-" * 32,
+    ]
+    for item in order.items:
+        line = f"{item.quantity}x {item.product_name}"
+        lines.append(f"{line:<24}P{item.line_total:.2f}")
+        if item.modifiers:
+            lines.append(f"    {item.modifiers}")
+        if item.notes:
+            lines.append(f"    Note: {item.notes}")
+    lines += ["-" * 32, f"{'TOTAL':<24}P{order.total:.2f}"]
+
+    if order.payment_method == "cash" and order.cash_tendered is not None:
+        lines.append(f"{'Cash Tendered':<24}P{order.cash_tendered:.2f}")
+        lines.append(f"{'Change':<24}P{order.change:.2f}")
+
+    lines += ["", settings.receipt_footer or ""]
+    return "\n".join(lines)
+
+
 @app.route("/api/orders/<int:order_id>/email-receipt", methods=["POST"])
 def email_receipt(order_id):
-    """Digital e-receipt. Stubbed: stores the email and reports success.
-    Swap in a real mail provider (e.g. Flask-Mail) when ready."""
+    """Sends the receipt to the customer's email via Gmail SMTP (Flask-Mail)."""
     order = Order.query.get_or_404(order_id)
     data = request.get_json() or {}
     email = data.get("email", "").strip()
@@ -170,9 +204,33 @@ def email_receipt(order_id):
     if not email:
         return jsonify({"error": "Email is required"}), 400
 
+    if not app.config.get("MAIL_USERNAME") or not app.config.get("MAIL_PASSWORD"):
+        return jsonify({
+            "error": "Email is not configured on the server. Set GMAIL_USER and "
+                     "GMAIL_APP_PASSWORD environment variables."
+        }), 500
+
+    settings = StoreSettings.query.first()
+    if not settings:
+        settings = StoreSettings()
+        db.session.add(settings)
+        db.session.commit()
+
+    try:
+        message = Message(
+            subject=f"Your Receipt - {settings.store_name} (Order #{order.order_number})",
+            recipients=[email],
+            body=build_receipt_email_body(order, settings),
+        )
+        mail.send(message)
+    except Exception as exc:
+        return jsonify({"error": f"Could not send email: {exc}"}), 502
+
     order.customer_email = email
     db.session.commit()
     return jsonify({"success": True, "message": f"Receipt sent to {email}"})
+
+
 
 
 # ================= Real-time sales tracking =================
