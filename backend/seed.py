@@ -1,13 +1,3 @@
-"""
-Creates tables (if needed) and seeds:
-  1. The real JoMa's menu (categories + products)
-  2. A starter ingredient list for Advanced Inventory & Ingredient Control
-  3. Recipe links (product -> ingredients consumed) for a few flagship dishes,
-     so stock automatically deducts when those items are sold.
-
-Run once: python seed.py
-"""
-
 from app import app
 from models import Category, Ingredient, Product, ProductIngredient, StoreSettings, db
 
