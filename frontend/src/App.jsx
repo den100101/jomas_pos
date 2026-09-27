@@ -12,7 +12,16 @@ import Shift from "./pages/Shift";
 import Settings from "./pages/Settings";
 
 function App() {
-  const [user, setUser] = useState(null);
+  const [user, setUser] = useState(() => {
+    const savedUser = localStorage.getItem("user");
+    return savedUser ? JSON.parse(savedUser) : null;
+  });
+
+  const handleLogout = () => {
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+    setUser(null);
+  };
 
   if (!user) {
     return <Login onLogin={setUser} />;
@@ -20,7 +29,7 @@ function App() {
 
   return (
     <BrowserRouter>
-      <Layout user={user} onLogout={() => setUser(null)}>
+      <Layout user={user} onLogout={handleLogout}>
         <Routes>
           <Route path="/" element={<Navigate to="/pos" replace />} />
           <Route path="/pos" element={<POS />} />
