@@ -34,7 +34,10 @@ class Config:
     JWT_TOKEN_LOCATION = ["headers"]
 
     # --- CORS -------------------------------------------------------
-    CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",")
+    CORS_ORIGINS = os.environ.get(
+        "CORS_ORIGINS",
+        "https://jomas-pos-1.onrender.com"
+    ).split(",")
 
     # --- Tax --------------------------------------------------------
     VAT_RATE = float(os.environ.get("VAT_RATE", "0.12"))
