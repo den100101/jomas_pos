@@ -1,14 +1,18 @@
+import os
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_mail import Mail,Message
-
+from flask_mail import Mail, Message
+from flask_jwt_extended import (
+    JWTManager, jwt_required, create_access_token, get_jwt_identity
+)
 
 load_dotenv()
 
 from config import Config
+from auth_utils import roles_required
 from models import (
     ORDER_STATUSES,
     PAYMENT_METHODS,
@@ -20,17 +24,32 @@ from models import (
     ProductIngredient,
     Shift,
     StoreSettings,
+    User,
     db,
 )
 
 app = Flask(__name__)
 app.config.from_object(Config)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}}, supports_credentials=True)
 db.init_app(app)
 mail = Mail(app)
+jwt = JWTManager(app)
 
 
-# ================= Auth (demo) =================
+# ================= Error handling (never leak stack traces) =================
+
+
+@jwt.unauthorized_loader
+def unauthorized(_reason):
+    return jsonify({"error": "Authentication required"}), 401
+
+
+@jwt.invalid_token_loader
+def invalid_token(_reason):
+    return jsonify({"error": "Invalid or expired token"}), 401
+
+
+# ================= Auth =================
 
 
 @app.route("/api/login", methods=["POST"])
@@ -39,21 +58,44 @@ def login():
     username = data.get("username", "").strip()
     password = data.get("password", "").strip()
 
-    if username and password:
-        return jsonify({"success": True, "user": {"name": "Admin User", "role": "Admin"}})
-    return jsonify({"success": False, "message": "Invalid credentials"}), 401
+    if not username or not password:
+        return jsonify({"success": False, "message": "Username and password are required"}), 400
+
+    user = User.query.filter_by(username=username, is_active=True).first()
+
+    # Same response whether the user exists or not, so we don't leak
+    # which usernames are valid.
+    if not user or not user.check_password(password):
+        return jsonify({"success": False, "message": "Invalid credentials"}), 401
+
+    token = create_access_token(
+        identity=str(user.id),
+        additional_claims={"role": user.role, "name": user.name},
+    )
+    return jsonify({"success": True, "access_token": token, "user": user.to_dict()})
+
+
+@app.route("/api/me", methods=["GET"])
+@jwt_required()
+def me():
+    user = User.query.get(int(get_jwt_identity()))
+    if not user:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(user.to_dict())
 
 
 # ================= Menu =================
 
 
 @app.route("/api/categories", methods=["GET"])
+@jwt_required()
 def get_categories():
     categories = Category.query.order_by(Category.id).all()
     return jsonify([c.to_dict() for c in categories])
 
 
 @app.route("/api/products", methods=["GET"])
+@jwt_required()
 def get_products():
     slug = request.args.get("category")
     query = Product.query
@@ -72,6 +114,7 @@ def get_products():
 
 
 @app.route("/api/orders", methods=["GET"])
+@jwt_required()
 def list_orders():
     """Supports ?status=pending,preparing for the kitchen board and ?limit=N for reports."""
     query = Order.query
@@ -87,12 +130,14 @@ def list_orders():
 
 
 @app.route("/api/orders/<int:order_id>", methods=["GET"])
+@jwt_required()
 def get_order(order_id):
     order = Order.query.get_or_404(order_id)
     return jsonify(order.to_dict())
 
 
 @app.route("/api/orders", methods=["POST"])
+@roles_required("admin", "cashier")
 def create_order():
     data = request.get_json() or {}
     cart = data.get("items", [])
@@ -151,6 +196,7 @@ def create_order():
 
 
 @app.route("/api/orders/<int:order_id>/status", methods=["PATCH"])
+@roles_required("admin", "kitchen", "cashier")
 def update_order_status(order_id):
     """Kitchen & operations management: advance an order through the queue."""
     order = Order.query.get_or_404(order_id)
@@ -195,6 +241,7 @@ def build_receipt_email_body(order, settings):
 
 
 @app.route("/api/orders/<int:order_id>/email-receipt", methods=["POST"])
+@roles_required("admin", "cashier")
 def email_receipt(order_id):
     """Sends the receipt to the customer's email via Gmail SMTP (Flask-Mail)."""
     order = Order.query.get_or_404(order_id)
@@ -231,12 +278,11 @@ def email_receipt(order_id):
     return jsonify({"success": True, "message": f"Receipt sent to {email}"})
 
 
-
-
 # ================= Real-time sales tracking =================
 
 
 @app.route("/api/sales/live", methods=["GET"])
+@jwt_required()
 def live_sales():
     """Polled by the POS ticker every few seconds for a live revenue/order count."""
     today_start = datetime.combine(datetime.today(), datetime.min.time())
@@ -260,6 +306,7 @@ def live_sales():
 
 
 @app.route("/api/reports/summary", methods=["GET"])
+@roles_required("admin", "cashier")
 def reports_summary():
     range_param = request.args.get("range", "today")  # today | 7d | 30d
     days = {"today": 1, "7d": 7, "30d": 30}.get(range_param, 1)
@@ -305,12 +352,14 @@ def reports_summary():
 
 
 @app.route("/api/ingredients", methods=["GET"])
+@jwt_required()
 def list_ingredients():
     ingredients = Ingredient.query.order_by(Ingredient.name).all()
     return jsonify([i.to_dict() for i in ingredients])
 
 
 @app.route("/api/ingredients", methods=["POST"])
+@roles_required("admin")
 def create_ingredient():
     data = request.get_json() or {}
     ingredient = Ingredient(
@@ -325,6 +374,7 @@ def create_ingredient():
 
 
 @app.route("/api/ingredients/<int:ingredient_id>", methods=["PATCH"])
+@roles_required("admin")
 def update_ingredient(ingredient_id):
     ingredient = Ingredient.query.get_or_404(ingredient_id)
     data = request.get_json() or {}
@@ -338,6 +388,7 @@ def update_ingredient(ingredient_id):
 
 
 @app.route("/api/ingredients/<int:ingredient_id>/restock", methods=["POST"])
+@roles_required("admin", "kitchen")
 def restock_ingredient(ingredient_id):
     ingredient = Ingredient.query.get_or_404(ingredient_id)
     data = request.get_json() or {}
@@ -352,6 +403,7 @@ def restock_ingredient(ingredient_id):
 
 
 @app.route("/api/shifts/current", methods=["GET"])
+@jwt_required()
 def current_shift():
     """Returns the open shift (if any) plus live stats: cash sales, total sales,
     transaction count since it opened."""
@@ -376,12 +428,14 @@ def current_shift():
 
 
 @app.route("/api/shifts", methods=["GET"])
+@jwt_required()
 def shift_history():
     shifts = Shift.query.order_by(Shift.id.desc()).limit(20).all()
     return jsonify([s.to_dict() for s in shifts])
 
 
 @app.route("/api/shifts/open", methods=["POST"])
+@jwt_required()
 def open_shift():
     existing = Shift.query.filter_by(status="open").first()
     if existing:
@@ -395,6 +449,7 @@ def open_shift():
 
 
 @app.route("/api/shifts/<int:shift_id>/close", methods=["POST"])
+@jwt_required()
 def close_shift(shift_id):
     shift = Shift.query.get_or_404(shift_id)
     if shift.status == "closed":
@@ -422,6 +477,7 @@ def close_shift(shift_id):
 
 
 @app.route("/api/settings", methods=["GET"])
+@jwt_required()
 def get_settings():
     settings = StoreSettings.query.first()
     if not settings:
@@ -432,6 +488,7 @@ def get_settings():
 
 
 @app.route("/api/settings", methods=["PUT"])
+@roles_required("admin")
 def update_settings():
     settings = StoreSettings.query.first()
     if not settings:
@@ -448,4 +505,5 @@ def update_settings():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)

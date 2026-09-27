@@ -5,3 +5,4 @@ PyMySQL==1.1.1
 python-dotenv==1.0.1
 Flask-Mail==0.10.0
 cryptography
+Flask-JWT-Extended==4.6.0
