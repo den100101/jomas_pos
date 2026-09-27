@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import api from "../api";
 
 function Login({ onLogin }) {
-  const [username, setUsername] = useState("chef@jomas.com");
+  const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -15,6 +15,9 @@ function Login({ onLogin }) {
     try {
       const res = await api.post("/login", { username, password });
       if (res.data.success) {
+        localStorage.setItem("token", res.data.access_token);
+        localStorage.setItem("user", JSON.stringify(res.data.user));
+
         onLogin(res.data.user);
       } else {
         setError(res.data.message || "Invalid credentials");
@@ -33,11 +36,15 @@ function Login({ onLogin }) {
           <span className="brand-icon">🔥</span> JoMa's
         </div>
         <h1>Arroz Frito Portal</h1>
-        <p className="login-tagline">Professional management for the perfect sizzle</p>
+        <p className="login-tagline">
+          Professional management for the perfect sizzle
+        </p>
 
         <div className="login-card">
           <h2>Internal Sign In</h2>
-          <p className="login-hint">Enter your credentials to access the kitchen dashboard</p>
+          <p className="login-hint">
+            Enter your credentials to access the kitchen dashboard
+          </p>
 
           <form onSubmit={handleSubmit}>
             <label htmlFor="username">Email or Username</label>
@@ -65,10 +72,14 @@ function Login({ onLogin }) {
             </button>
           </form>
 
-          <div className="login-footer">PROTECTED BY JOMA'S SECURITY SYSTEMS</div>
+          <div className="login-footer">
+            PROTECTED BY JOMA'S SECURITY SYSTEMS
+          </div>
         </div>
 
-        <p className="login-copyright">© 2026 JoMa's Arroz Frito Co. All rights reserved.</p>
+        <p className="login-copyright">
+          © 2026 JoMa's Arroz Frito Co. All rights reserved.
+        </p>
       </div>
     </div>
   );
