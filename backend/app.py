@@ -1,8 +1,10 @@
+import csv
+import io
 import os
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from flask_mail import Mail, Message
 from flask_jwt_extended import (
@@ -34,6 +36,11 @@ CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}}, supports_cred
 db.init_app(app)
 mail = Mail(app)
 jwt = JWTManager(app)
+
+# Who can do what:
+#   admin   - everything
+#   cashier - POS only: menu, taking orders, receipts, live sales ticker
+#   kitchen - kitchen board only: see orders and move them through the queue
 
 
 # ================= Error handling (never leak stack traces) =================
@@ -84,18 +91,18 @@ def me():
     return jsonify(user.to_dict())
 
 
-# ================= Menu =================
+# ================= Menu (admin + cashier) =================
 
 
 @app.route("/api/categories", methods=["GET"])
-@jwt_required()
+@roles_required("admin", "cashier")
 def get_categories():
     categories = Category.query.order_by(Category.id).all()
     return jsonify([c.to_dict() for c in categories])
 
 
 @app.route("/api/products", methods=["GET"])
-@jwt_required()
+@roles_required("admin", "cashier")
 def get_products():
     slug = request.args.get("category")
     query = Product.query
@@ -114,7 +121,7 @@ def get_products():
 
 
 @app.route("/api/orders", methods=["GET"])
-@jwt_required()
+@roles_required("admin", "cashier", "kitchen")
 def list_orders():
     """Supports ?status=pending,preparing for the kitchen board and ?limit=N for reports."""
     query = Order.query
@@ -124,13 +131,13 @@ def list_orders():
         statuses = [s.strip() for s in status_param.split(",")]
         query = query.filter(Order.status.in_(statuses))
 
-    limit = int(request.args.get("limit", 100))
+    limit = max(1, min(request.args.get("limit", 100, type=int), 500))
     orders = query.order_by(Order.id.desc()).limit(limit).all()
     return jsonify([o.to_dict() for o in orders])
 
 
 @app.route("/api/orders/<int:order_id>", methods=["GET"])
-@jwt_required()
+@roles_required("admin", "cashier")
 def get_order(order_id):
     order = Order.query.get_or_404(order_id)
     return jsonify(order.to_dict())
@@ -150,11 +157,34 @@ def create_order():
     if payment_method not in PAYMENT_METHODS:
         return jsonify({"error": "Invalid payment method"}), 400
 
-    subtotal = round(sum(item["price"] * item["quantity"] for item in cart), 2)
+    # Validate every cart line up front so bad data can never reach the
+    # reports (e.g. a negative quantity would show up as negative revenue).
+    clean_items = []
+    for item in cart:
+        try:
+            line = {
+                "id": int(item["id"]),
+                "name": str(item["name"])[:100],
+                "price": float(item["price"]),
+                "quantity": int(item["quantity"]),
+                "modifiers": str(item["modifiers"])[:255] if item.get("modifiers") else None,
+                "notes": str(item["notes"])[:255] if item.get("notes") else None,
+            }
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"error": "Each cart item needs id, name, price and quantity"}), 400
+        if line["quantity"] < 1 or line["price"] < 0:
+            return jsonify({"error": "Quantity must be at least 1 and price cannot be negative"}), 400
+        clean_items.append(line)
+
+    subtotal = round(sum(i["price"] * i["quantity"] for i in clean_items), 2)
     total = subtotal  # no VAT/tax applied
 
     change = None
     if payment_method == "cash" and cash_tendered is not None:
+        try:
+            cash_tendered = float(cash_tendered)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Cash tendered must be a number"}), 400
         change = round(cash_tendered - total, 2)
 
     order = Order(
@@ -169,7 +199,7 @@ def create_order():
     db.session.add(order)
     db.session.flush()  # get order.id before commit
 
-    for item in cart:
+    for item in clean_items:
         db.session.add(
             OrderItem(
                 order_id=order.id,
@@ -177,8 +207,8 @@ def create_order():
                 unit_price=item["price"],
                 quantity=item["quantity"],
                 line_total=round(item["price"] * item["quantity"], 2),
-                modifiers=item.get("modifiers"),
-                notes=item.get("notes"),
+                modifiers=item["modifiers"],
+                notes=item["notes"],
             )
         )
 
@@ -196,7 +226,7 @@ def create_order():
 
 
 @app.route("/api/orders/<int:order_id>/status", methods=["PATCH"])
-@roles_required("admin", "kitchen", "cashier")
+@roles_required("admin", "kitchen")
 def update_order_status(order_id):
     """Kitchen & operations management: advance an order through the queue."""
     order = Order.query.get_or_404(order_id)
@@ -278,14 +308,156 @@ def email_receipt(order_id):
     return jsonify({"success": True, "message": f"Receipt sent to {email}"})
 
 
-# ================= Real-time sales tracking =================
+# ================= Reporting helpers =================
+
+# The database stores UTC, but the shop runs on Philippine time (UTC+8, no
+# daylight saving). "Today" and "hour of day" must follow shop time, so every
+# report converts with this offset. Override with STORE_UTC_OFFSET_HOURS.
+STORE_UTC_OFFSET = timedelta(hours=int(os.environ.get("STORE_UTC_OFFSET_HOURS", "8")))
+MAX_REPORT_DAYS = 366
+GROUP_OPTIONS = ("day", "hour", "product", "payment")
+
+
+def local_today():
+    return (datetime.utcnow() + STORE_UTC_OFFSET).date()
+
+
+def local_midnight_as_utc(day):
+    """Start of a shop-time calendar day, as the UTC datetime stored in the DB."""
+    return datetime.combine(day, datetime.min.time()) - STORE_UTC_OFFSET
+
+
+def resolve_range(range_key, start_str=None, end_str=None):
+    """Turns today / 7d / 30d / custom into (start_date, end_date, since_utc, until_utc)."""
+    today = local_today()
+    if range_key == "custom":
+        try:
+            start = datetime.strptime(start_str or "", "%Y-%m-%d").date()
+            end = datetime.strptime(end_str or "", "%Y-%m-%d").date()
+        except ValueError:
+            raise ValueError("Custom range needs start and end dates as YYYY-MM-DD")
+        if end < start:
+            raise ValueError("End date cannot be before the start date")
+        if (end - start).days >= MAX_REPORT_DAYS:
+            raise ValueError(f"Date range cannot be longer than {MAX_REPORT_DAYS} days")
+    elif range_key == "7d":
+        start, end = today - timedelta(days=6), today
+    elif range_key == "30d":
+        start, end = today - timedelta(days=29), today
+    else:
+        start = end = today
+
+    since = local_midnight_as_utc(start)
+    until = local_midnight_as_utc(end + timedelta(days=1))
+    return start, end, since, until
+
+
+def orders_between(since, until):
+    return Order.query.filter(Order.created_at >= since, Order.created_at < until).all()
+
+
+def summarize(orders):
+    revenue = round(sum(o.total for o in orders), 2)
+    count = len(orders)
+    return {
+        "revenue": revenue,
+        "orders": count,
+        "items_sold": sum(i.quantity for o in orders for i in o.items),
+        "avg_ticket": round(revenue / count, 2) if count else 0,
+    }
+
+
+def group_orders(orders, group_by, start, end, top=10):
+    """Builds the rows for the bar graph / table. Each row has a label plus
+    revenue, orders, items_sold and avg_ticket so the screen can chart any metric."""
+    buckets = {}
+
+    def bucket(label):
+        return buckets.setdefault(
+            label, {"label": label, "revenue": 0.0, "orders": 0, "items_sold": 0}
+        )
+
+    def finish(rows):
+        for row in rows:
+            row["revenue"] = round(row["revenue"], 2)
+            row["avg_ticket"] = round(row["revenue"] / row["orders"], 2) if row["orders"] else 0
+        return rows
+
+    if group_by == "product":
+        for order in orders:
+            counted = set()
+            for item in order.items:
+                row = bucket(item.product_name)
+                row["revenue"] += item.line_total
+                row["items_sold"] += item.quantity
+                if item.product_name not in counted:  # count each order once per product
+                    row["orders"] += 1
+                    counted.add(item.product_name)
+        ranked = sorted(buckets.values(), key=lambda r: r["revenue"], reverse=True)
+        return finish(ranked[:top])
+
+    for order in orders:
+        local = order.created_at + STORE_UTC_OFFSET
+        if group_by == "day":
+            label = local.date().isoformat()
+        elif group_by == "hour":
+            label = f"{local.hour:02d}:00"
+        else:
+            label = order.payment_method
+        row = bucket(label)
+        row["revenue"] += order.total
+        row["orders"] += 1
+        row["items_sold"] += sum(i.quantity for i in order.items)
+
+    if group_by == "day":
+        day = start
+        while day <= end:  # show quiet days as empty bars instead of skipping them
+            bucket(day.isoformat())
+            day += timedelta(days=1)
+        rows = [buckets[key] for key in sorted(buckets)]
+    elif group_by == "hour":
+        if buckets:
+            hours = sorted(int(key[:2]) for key in buckets)
+            for hour in range(hours[0], hours[-1] + 1):
+                bucket(f"{hour:02d}:00")
+        rows = [buckets[key] for key in sorted(buckets)]
+    else:
+        rows = sorted(buckets.values(), key=lambda r: r["revenue"], reverse=True)
+    return finish(rows)
+
+
+def csv_safe(value):
+    """Stops spreadsheet apps from running cell text that starts with = + - @ as a formula."""
+    text = str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+
+
+def csv_response(rows, totals, group_by, start, end):
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([group_by.title(), "Revenue", "Orders", "Items Sold", "Avg Ticket"])
+    for row in rows:
+        writer.writerow([csv_safe(row["label"]), row["revenue"], row["orders"],
+                         row["items_sold"], row["avg_ticket"]])
+    writer.writerow([])
+    writer.writerow(["TOTAL (all orders in range)", totals["revenue"], totals["orders"],
+                     totals["items_sold"], totals["avg_ticket"]])
+    filename = f"sales-by-{group_by}-{start}-to-{end}.csv"
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+# ================= Real-time sales tracking (admin + cashier) =================
 
 
 @app.route("/api/sales/live", methods=["GET"])
-@jwt_required()
+@roles_required("admin", "cashier")
 def live_sales():
     """Polled by the POS ticker every few seconds for a live revenue/order count."""
-    today_start = datetime.combine(datetime.today(), datetime.min.time())
+    today_start = local_midnight_as_utc(local_today())
     todays_orders = Order.query.filter(Order.created_at >= today_start).all()
 
     revenue_today = round(sum(o.total for o in todays_orders), 2)
@@ -302,60 +474,102 @@ def live_sales():
     )
 
 
-# ================= Reporting & analytics =================
+# ================= Reporting & analytics (admin only) =================
 
 
-@app.route("/api/reports/summary", methods=["GET"])
-@roles_required("admin", "cashier")
-def reports_summary():
-    range_param = request.args.get("range", "today")  # today | 7d | 30d
-    days = {"today": 1, "7d": 7, "30d": 30}.get(range_param, 1)
-    since = datetime.now() - timedelta(days=days)
+@app.route("/api/reports/custom", methods=["GET"])
+@roles_required("admin")
+def custom_report():
+    """Customizable report. Query params:
+      range     today | 7d | 30d | custom   (custom also needs start and end, YYYY-MM-DD)
+      group_by  day | hour | product | payment
+      top       how many products to keep when group_by=product (1-50)
+      format    csv to download the same report as a spreadsheet file
+    """
+    group_by = request.args.get("group_by", "day")
+    if group_by not in GROUP_OPTIONS:
+        return jsonify({"error": f"group_by must be one of {list(GROUP_OPTIONS)}"}), 400
 
-    orders = Order.query.filter(Order.created_at >= since).all()
+    try:
+        start, end, since, until = resolve_range(
+            request.args.get("range", "today"),
+            request.args.get("start"),
+            request.args.get("end"),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    total_revenue = round(sum(o.total for o in orders), 2)
-    total_transactions = len(orders)
-    average_ticket = round(total_revenue / total_transactions, 2) if total_transactions else 0
+    top = max(1, min(request.args.get("top", 10, type=int), 50))
 
-    payment_split = {}
-    for o in orders:
-        payment_split[o.payment_method] = payment_split.get(o.payment_method, 0) + o.total
-    payment_split = {k: round(v, 2) for k, v in payment_split.items()}
+    orders = orders_between(since, until)
+    rows = group_orders(orders, group_by, start, end, top)
+    totals = summarize(orders)
 
-    item_totals = {}
-    for o in orders:
-        for item in o.items:
-            entry = item_totals.setdefault(item.product_name, {"quantity": 0, "revenue": 0})
-            entry["quantity"] += item.quantity
-            entry["revenue"] += item.line_total
-
-    top_items = sorted(
-        [{"name": k, **v} for k, v in item_totals.items()],
-        key=lambda x: x["revenue"],
-        reverse=True,
-    )[:10]
+    if request.args.get("format") == "csv":
+        return csv_response(rows, totals, group_by, start, end)
 
     return jsonify(
         {
-            "range": range_param,
-            "total_revenue": total_revenue,
-            "total_transactions": total_transactions,
-            "average_ticket": average_ticket,
-            "payment_split": payment_split,
-            "top_items": top_items,
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "group_by": group_by,
+            "rows": rows,
+            "totals": totals,
         }
     )
 
 
-# ================= Advanced inventory & ingredient control =================
+@app.route("/api/reports/summary", methods=["GET"])
+@roles_required("admin")
+def reports_summary():
+    try:
+        start, end, since, until = resolve_range(
+            request.args.get("range", "today"),
+            request.args.get("start"),
+            request.args.get("end"),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    orders = orders_between(since, until)
+    totals = summarize(orders)
+    payments = group_orders(orders, "payment", start, end)
+    products = group_orders(orders, "product", start, end, 10)
+
+    return jsonify(
+        {
+            "range": request.args.get("range", "today"),
+            "total_revenue": totals["revenue"],
+            "total_transactions": totals["orders"],
+            "average_ticket": totals["avg_ticket"],
+            "payment_split": {p["label"]: p["revenue"] for p in payments},
+            "top_items": [
+                {"name": p["label"], "quantity": p["items_sold"], "revenue": p["revenue"]}
+                for p in products
+            ],
+        }
+    )
+
+
+# ================= Advanced inventory & ingredient control (admin only) =================
 
 
 @app.route("/api/ingredients", methods=["GET"])
-@jwt_required()
+@roles_required("admin")
 def list_ingredients():
     ingredients = Ingredient.query.order_by(Ingredient.name).all()
     return jsonify([i.to_dict() for i in ingredients])
+
+
+@app.route("/api/ingredients/low-stock", methods=["GET"])
+@roles_required("admin")
+def low_stock():
+    """Ingredients at or below their reorder level - feeds the notification bell."""
+    items = (
+        Ingredient.query.filter(Ingredient.stock_quantity <= Ingredient.reorder_level)
+        .order_by(Ingredient.name)
+        .all()
+    )
+    return jsonify({"count": len(items), "items": [i.to_dict() for i in items]})
 
 
 @app.route("/api/ingredients", methods=["POST"])
@@ -388,7 +602,7 @@ def update_ingredient(ingredient_id):
 
 
 @app.route("/api/ingredients/<int:ingredient_id>/restock", methods=["POST"])
-@roles_required("admin", "kitchen")
+@roles_required("admin")
 def restock_ingredient(ingredient_id):
     ingredient = Ingredient.query.get_or_404(ingredient_id)
     data = request.get_json() or {}
@@ -403,7 +617,7 @@ def restock_ingredient(ingredient_id):
 
 
 @app.route("/api/shifts/current", methods=["GET"])
-@jwt_required()
+@roles_required("admin", "cashier")
 def current_shift():
     """Returns the open shift (if any) plus live stats: cash sales, total sales,
     transaction count since it opened."""
@@ -428,14 +642,14 @@ def current_shift():
 
 
 @app.route("/api/shifts", methods=["GET"])
-@jwt_required()
+@roles_required("admin")
 def shift_history():
     shifts = Shift.query.order_by(Shift.id.desc()).limit(20).all()
     return jsonify([s.to_dict() for s in shifts])
 
 
 @app.route("/api/shifts/open", methods=["POST"])
-@jwt_required()
+@roles_required("admin")
 def open_shift():
     existing = Shift.query.filter_by(status="open").first()
     if existing:
@@ -449,7 +663,7 @@ def open_shift():
 
 
 @app.route("/api/shifts/<int:shift_id>/close", methods=["POST"])
-@jwt_required()
+@roles_required("admin")
 def close_shift(shift_id):
     shift = Shift.query.get_or_404(shift_id)
     if shift.status == "closed":
@@ -477,7 +691,7 @@ def close_shift(shift_id):
 
 
 @app.route("/api/settings", methods=["GET"])
-@jwt_required()
+@roles_required("admin", "cashier")
 def get_settings():
     settings = StoreSettings.query.first()
     if not settings:
