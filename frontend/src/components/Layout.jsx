@@ -1,6 +1,18 @@
 import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import SalesTicker from "./SalesTicker";
+import LowStockBell from "./LowStockBell";
+import { PAGE_PATHS, canAccess } from "../utils/auth";
+
+// Every menu link; each user only sees the ones their role can open.
+const NAV_ITEMS = [
+  { page: "pos", label: "POS" },
+  { page: "kitchen", label: "Kitchen" },
+  { page: "inventory", label: "Inventory" },
+  { page: "reports", label: "Reports" },
+  { page: "shift", label: "Shift" },
+  { page: "settings", label: "Settings" },
+];
 
 function Layout({ user, onLogout, children }) {
   const navigate = useNavigate();
@@ -19,27 +31,24 @@ function Layout({ user, onLogout, children }) {
         </div>
 
         <nav className="topnav">
-          <NavLink to="/pos" className="nav-link">
-            POS
-          </NavLink>
-          <NavLink to="/kitchen" className="nav-link">
-            Kitchen
-          </NavLink>
-          <NavLink to="/inventory" className="nav-link">
-            Inventory
-          </NavLink>
-          <NavLink to="/reports" className="nav-link">
-            Reports
-          </NavLink>
-          <NavLink to="/shift" className="nav-link">
-            Shift
-          </NavLink>
-          <NavLink to="/settings" className="nav-link">
-            Settings
-          </NavLink>
+          {NAV_ITEMS.filter((item) => canAccess(user.role, item.page)).map(
+            (item) => (
+              <NavLink
+                key={item.page}
+                to={PAGE_PATHS[item.page]}
+                className="nav-link"
+              >
+                {item.label}
+              </NavLink>
+            ),
+          )}
         </nav>
 
-        <SalesTicker />
+        {/* The sales ticker shows revenue, so kitchen staff don't get it */}
+        {canAccess(user.role, "pos") && <SalesTicker />}
+
+        {/* Low-stock bell: only appears for admins */}
+        <LowStockBell />
 
         <div className="user-box">
           <div className="user-info">

@@ -1,8 +1,8 @@
 // Helpers for the logged-in user. Login.jsx saves "token" and "user" in localStorage.
 
-// Where each page lives. Change these if your App.jsx uses different paths.
+// Where each page lives (these match the routes in App.jsx).
 export const PAGE_PATHS = {
-  pos: "/",
+  pos: "/pos",
   kitchen: "/kitchen",
   inventory: "/inventory",
   reports: "/reports",
@@ -11,6 +11,7 @@ export const PAGE_PATHS = {
 };
 
 // Which pages each role can open. Admin manages everything.
+// "receipt" is the receipt screen shown after a sale (/receipt/:orderId).
 export const ROLE_PAGES = {
   admin: [
     "pos",
@@ -33,20 +34,6 @@ export function getUser() {
   }
 }
 
-export function getToken() {
-  return localStorage.getItem("token");
-}
-
-export function saveSession(token, user) {
-  localStorage.setItem("token", token);
-  localStorage.setItem("user", JSON.stringify(user));
-}
-
-export function clearSession() {
-  localStorage.removeItem("token");
-  localStorage.removeItem("user");
-}
-
 export function canAccess(role, page) {
   return (ROLE_PAGES[role] || []).includes(page);
 }
@@ -54,5 +41,5 @@ export function canAccess(role, page) {
 // First page a role is allowed to see - used after login and for blocked pages.
 export function homePathFor(role) {
   const first = (ROLE_PAGES[role] || [])[0];
-  return first ? PAGE_PATHS[first] : "/login";
+  return PAGE_PATHS[first] || "/pos";
 }
