@@ -34,6 +34,20 @@ export function getUser() {
   }
 }
 
+export function getToken() {
+  return localStorage.getItem("token");
+}
+
+export function saveSession(token, user) {
+  localStorage.setItem("token", token);
+  localStorage.setItem("user", JSON.stringify(user));
+}
+
+export function clearSession() {
+  localStorage.removeItem("token");
+  localStorage.removeItem("user");
+}
+
 export function canAccess(role, page) {
   return (ROLE_PAGES[role] || []).includes(page);
 }
