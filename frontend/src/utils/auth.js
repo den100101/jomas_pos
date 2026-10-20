@@ -3,9 +3,10 @@
 // Where each page lives (these match the routes in App.jsx).
 export const PAGE_PATHS = {
   pos: "/pos",
+  orders: "/orders",
   kitchen: "/kitchen",
   inventory: "/inventory",
-  reports: "/reports",
+  reports: "/reports", // shown to users as "Dashboard"
   shift: "/shift",
   settings: "/settings",
 };
@@ -13,16 +14,8 @@ export const PAGE_PATHS = {
 // Which pages each role can open. Admin manages everything.
 // "receipt" is the receipt screen shown after a sale (/receipt/:orderId).
 export const ROLE_PAGES = {
-  admin: [
-    "pos",
-    "receipt",
-    "kitchen",
-    "inventory",
-    "reports",
-    "shift",
-    "settings",
-  ],
-  cashier: ["pos", "receipt"],
+  admin: ["pos", "receipt", "orders", "kitchen", "inventory", "reports", "shift", "settings"],
+  cashier: ["pos", "receipt", "orders"],
   kitchen: ["kitchen"],
 };
 

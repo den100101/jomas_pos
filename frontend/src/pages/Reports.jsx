@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import api from "../api";
 import BarChart from "../components/BarChart";
+import LineChart from "../components/LineChart";
 import "../styles/analytics.css";
 
 const peso = (value) =>
@@ -31,7 +32,7 @@ const STORAGE_KEY = "joma_report_presets";
 
 const toInputDate = (date) =>
   `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
-    date.getDate(),
+    date.getDate()
   ).padStart(2, "0")}`;
 
 function loadSavedReports() {
@@ -51,6 +52,7 @@ export default function Reports() {
   const [end, setEnd] = useState(today);
   const [groupBy, setGroupBy] = useState("hour");
   const [metric, setMetric] = useState("revenue");
+  const [chartType, setChartType] = useState("bar");
   const [top, setTop] = useState(10);
 
   // What came back
@@ -64,7 +66,7 @@ export default function Reports() {
 
   const params = useMemo(
     () => ({ range: preset, start, end, group_by: groupBy, top }),
-    [preset, start, end, groupBy, top],
+    [preset, start, end, groupBy, top]
   );
 
   useEffect(() => {
@@ -80,7 +82,7 @@ export default function Reports() {
       .catch((err) => {
         if (!ignore) {
           setReport(null);
-          setError(err.response?.data?.error || "Could not load the report.");
+          setError(err.response?.data?.error || "Could not load the dashboard.");
         }
       })
       .finally(() => {
@@ -126,7 +128,7 @@ export default function Reports() {
   const saveCurrent = () => {
     const name = saveName.trim();
     if (!name) return;
-    const entry = { name, preset, start, end, groupBy, metric, top };
+    const entry = { name, preset, start, end, groupBy, metric, chartType, top };
     persist([...saved.filter((item) => item.name !== name), entry].slice(-10));
     setSaveName("");
   };
@@ -137,19 +139,26 @@ export default function Reports() {
     setEnd(item.end);
     setGroupBy(item.groupBy);
     setMetric(item.metric);
+    setChartType(item.chartType || "bar");
     setTop(item.top);
   };
 
   const metricInfo = METRICS[metric];
   const rows = report ? report.rows : [];
   const totals = report ? report.totals : null;
+  const cancelled = report ? report.cancelled : null;
+
+  // A line only makes sense over time (days or hours), not across products or payment types.
+  const canUseLine = groupBy === "day" || groupBy === "hour";
+  const showLine = canUseLine && chartType === "line";
+  const Chart = showLine ? LineChart : BarChart;
 
   const labelFormat =
     groupBy === "day"
       ? (label) => label.slice(5)
       : groupBy === "payment"
-        ? (label) => label.charAt(0).toUpperCase() + label.slice(1)
-        : undefined;
+      ? (label) => label.charAt(0).toUpperCase() + label.slice(1)
+      : undefined;
 
   const chartTitle =
     groupBy === "product"
@@ -158,7 +167,7 @@ export default function Reports() {
 
   return (
     <div className="report-page">
-      <h2>Sales Analytics</h2>
+      <h2>Dashboard</h2>
 
       <div className="report-controls">
         <div className="report-field">
@@ -181,22 +190,11 @@ export default function Reports() {
           <>
             <label className="report-field">
               From
-              <input
-                type="date"
-                value={start}
-                max={end || today}
-                onChange={(e) => setStart(e.target.value)}
-              />
+              <input type="date" value={start} max={end || today} onChange={(e) => setStart(e.target.value)} />
             </label>
             <label className="report-field">
               To
-              <input
-                type="date"
-                value={end}
-                min={start}
-                max={today}
-                onChange={(e) => setEnd(e.target.value)}
-              />
+              <input type="date" value={end} min={start} max={today} onChange={(e) => setEnd(e.target.value)} />
             </label>
           </>
         )}
@@ -205,9 +203,7 @@ export default function Reports() {
           Group by
           <select value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>
             {Object.entries(GROUPS).map(([key, label]) => (
-              <option key={key} value={key}>
-                {label}
-              </option>
+              <option key={key} value={key}>{label}</option>
             ))}
           </select>
         </label>
@@ -216,24 +212,39 @@ export default function Reports() {
           Show on graph
           <select value={metric} onChange={(e) => setMetric(e.target.value)}>
             {Object.entries(METRICS).map(([key, info]) => (
-              <option key={key} value={key}>
-                {info.label}
-              </option>
+              <option key={key} value={key}>{info.label}</option>
             ))}
           </select>
         </label>
 
+        {canUseLine && (
+          <div className="report-field">
+            Graph type
+            <div className="preset-buttons">
+              <button
+                type="button"
+                className={`report-btn ${!showLine ? "active" : ""}`}
+                onClick={() => setChartType("bar")}
+              >
+                Bar
+              </button>
+              <button
+                type="button"
+                className={`report-btn ${showLine ? "active" : ""}`}
+                onClick={() => setChartType("line")}
+              >
+                Line
+              </button>
+            </div>
+          </div>
+        )}
+
         {groupBy === "product" && (
           <label className="report-field">
             Products shown
-            <select
-              value={top}
-              onChange={(e) => setTop(Number(e.target.value))}
-            >
+            <select value={top} onChange={(e) => setTop(Number(e.target.value))}>
               {[5, 10, 20].map((n) => (
-                <option key={n} value={n}>
-                  Top {n}
-                </option>
+                <option key={n} value={n}>Top {n}</option>
               ))}
             </select>
           </label>
@@ -241,11 +252,7 @@ export default function Reports() {
 
         <div className="report-field">
           Export
-          <button
-            type="button"
-            className="report-btn primary"
-            onClick={exportCsv}
-          >
+          <button type="button" className="report-btn primary" onClick={exportCsv}>
             Download CSV
           </button>
         </div>
@@ -254,7 +261,7 @@ export default function Reports() {
       <div className="report-saved">
         <input
           type="text"
-          placeholder="Name this report setup..."
+          placeholder="Name this setup..."
           value={saveName}
           maxLength={40}
           onChange={(e) => setSaveName(e.target.value)}
@@ -264,9 +271,7 @@ export default function Reports() {
         </button>
         {saved.map((item) => (
           <span className="saved-chip" key={item.name}>
-            <button type="button" onClick={() => applySaved(item)}>
-              {item.name}
-            </button>
+            <button type="button" onClick={() => applySaved(item)}>{item.name}</button>
             <button
               type="button"
               className="saved-remove"
@@ -283,22 +288,17 @@ export default function Reports() {
 
       {totals && (
         <div className="report-cards">
-          <div className="report-card">
-            <span>Total revenue</span>
-            <strong>{peso(totals.revenue)}</strong>
-          </div>
-          <div className="report-card">
-            <span>Orders</span>
-            <strong>{totals.orders}</strong>
-          </div>
-          <div className="report-card">
-            <span>Items sold</span>
-            <strong>{totals.items_sold}</strong>
-          </div>
-          <div className="report-card">
-            <span>Average ticket</span>
-            <strong>{peso(totals.avg_ticket)}</strong>
-          </div>
+          <div className="report-card"><span>Total revenue</span><strong>{peso(totals.revenue)}</strong></div>
+          <div className="report-card"><span>Orders</span><strong>{totals.orders}</strong></div>
+          <div className="report-card"><span>Items sold</span><strong>{totals.items_sold}</strong></div>
+          <div className="report-card"><span>Average ticket</span><strong>{peso(totals.avg_ticket)}</strong></div>
+          {cancelled && (
+            <div className="report-card">
+              <span>Cancelled orders</span>
+              <strong>{cancelled.orders}</strong>
+              <small>{peso(cancelled.amount)} not counted in sales</small>
+            </div>
+          )}
         </div>
       )}
 
@@ -307,12 +307,7 @@ export default function Reports() {
         {loading ? (
           <p className="chart-empty">Loading...</p>
         ) : (
-          <BarChart
-            rows={rows}
-            valueKey={metric}
-            format={metricInfo.format}
-            labelFormat={labelFormat}
-          />
+          <Chart rows={rows} valueKey={metric} format={metricInfo.format} labelFormat={labelFormat} />
         )}
       </div>
 

@@ -8,7 +8,7 @@ from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from flask_mail import Mail, Message
 from flask_jwt_extended import (
-    JWTManager, jwt_required, create_access_token, get_jwt_identity
+    JWTManager, jwt_required, create_access_token, get_jwt, get_jwt_identity
 )
 
 load_dotenv()
@@ -16,8 +16,10 @@ load_dotenv()
 from config import Config
 from auth_utils import roles_required
 from models import (
+    LOW_STOCK_MINIMUM,
     ORDER_STATUSES,
     PAYMENT_METHODS,
+    STORE_UTC_OFFSET,
     Category,
     Ingredient,
     Order,
@@ -188,7 +190,7 @@ def create_order():
         change = round(cash_tendered - total, 2)
 
     order = Order(
-        order_number="JF-" + datetime.now().strftime("%Y%m%d%H%M%S"),
+        order_number="JF-" + (datetime.utcnow() + STORE_UTC_OFFSET).strftime("%Y%m%d%H%M%S"),
         subtotal=subtotal,
         total=total,
         payment_method=payment_method,
@@ -203,6 +205,7 @@ def create_order():
         db.session.add(
             OrderItem(
                 order_id=order.id,
+                product_id=item["id"],
                 product_name=item["name"],
                 unit_price=item["price"],
                 quantity=item["quantity"],
@@ -230,6 +233,8 @@ def create_order():
 def update_order_status(order_id):
     """Kitchen & operations management: advance an order through the queue."""
     order = Order.query.get_or_404(order_id)
+    if order.status == "cancelled":
+        return jsonify({"error": "This order was cancelled"}), 400
     data = request.get_json() or {}
     new_status = data.get("status")
 
@@ -241,6 +246,43 @@ def update_order_status(order_id):
     return jsonify(order.to_dict())
 
 
+@app.route("/api/orders/<int:order_id>/cancel", methods=["POST"])
+@roles_required("admin", "cashier")
+def cancel_order(order_id):
+    """Reverses an order that was punched in by mistake: marks it cancelled, puts the
+    ingredients back in stock, and keeps who cancelled it and why. Cancelled orders
+    are left out of sales, the dashboard and the cash drawer."""
+    order = Order.query.get_or_404(order_id)
+    claims = get_jwt()
+
+    if order.status == "cancelled":
+        return jsonify({"error": "This order is already cancelled"}), 400
+    if order.status == "completed" and claims.get("role") != "admin":
+        return jsonify({"error": "Only an admin can cancel a completed order"}), 403
+
+    data = request.get_json() or {}
+    reason = str(data.get("reason") or "").strip()[:255]
+    if not reason:
+        return jsonify({"error": "Please give a reason for cancelling"}), 400
+
+    # Put back the ingredients that were used when the order was placed.
+    # (Orders made before this feature have no product_id, so they are skipped.)
+    for item in order.items:
+        if not item.product_id:
+            continue
+        for row in ProductIngredient.query.filter_by(product_id=item.product_id).all():
+            ingredient = Ingredient.query.get(row.ingredient_id)
+            if ingredient:
+                ingredient.stock_quantity += row.quantity_required * item.quantity
+
+    order.status = "cancelled"
+    order.cancelled_at = datetime.utcnow()
+    order.cancelled_by = claims.get("name")
+    order.cancel_reason = reason
+    db.session.commit()
+    return jsonify(order.to_dict())
+
+
 def build_receipt_email_body(order, settings):
     """Plain-text receipt body used in the e-receipt email."""
     lines = [
@@ -248,7 +290,7 @@ def build_receipt_email_body(order, settings):
         settings.receipt_header or "",
         "",
         f"Order #: {order.order_number}",
-        f"Date: {order.created_at.strftime('%Y-%m-%d %I:%M %p')}",
+        f"Date: {(order.created_at + STORE_UTC_OFFSET).strftime('%Y-%m-%d %I:%M %p')}",
         f"Payment: {order.payment_method.upper()}",
         "",
         "-" * 32,
@@ -275,6 +317,8 @@ def build_receipt_email_body(order, settings):
 def email_receipt(order_id):
     """Sends the receipt to the customer's email via Gmail SMTP (Flask-Mail)."""
     order = Order.query.get_or_404(order_id)
+    if order.status == "cancelled":
+        return jsonify({"error": "This order was cancelled"}), 400
     data = request.get_json() or {}
     email = data.get("email", "").strip()
 
@@ -313,7 +357,6 @@ def email_receipt(order_id):
 # The database stores UTC, but the shop runs on Philippine time (UTC+8, no
 # daylight saving). "Today" and "hour of day" must follow shop time, so every
 # report converts with this offset. Override with STORE_UTC_OFFSET_HOURS.
-STORE_UTC_OFFSET = timedelta(hours=int(os.environ.get("STORE_UTC_OFFSET_HOURS", "8")))
 MAX_REPORT_DAYS = 366
 GROUP_OPTIONS = ("day", "hour", "product", "payment")
 
@@ -353,7 +396,9 @@ def resolve_range(range_key, start_str=None, end_str=None):
 
 
 def orders_between(since, until):
-    return Order.query.filter(Order.created_at >= since, Order.created_at < until).all()
+    return Order.query.filter(
+        Order.created_at >= since, Order.created_at < until, Order.status != "cancelled"
+    ).all()
 
 
 def summarize(orders):
@@ -426,6 +471,14 @@ def group_orders(orders, group_by, start, end, top=10):
     return finish(rows)
 
 
+def cancelled_summary(since, until):
+    """How many orders were cancelled in the period, and their value (shown on the dashboard)."""
+    cancelled = Order.query.filter(
+        Order.created_at >= since, Order.created_at < until, Order.status == "cancelled"
+    ).all()
+    return {"orders": len(cancelled), "amount": round(sum(o.total for o in cancelled), 2)}
+
+
 def csv_safe(value):
     """Stops spreadsheet apps from running cell text that starts with = + - @ as a formula."""
     text = str(value)
@@ -458,7 +511,9 @@ def csv_response(rows, totals, group_by, start, end):
 def live_sales():
     """Polled by the POS ticker every few seconds for a live revenue/order count."""
     today_start = local_midnight_as_utc(local_today())
-    todays_orders = Order.query.filter(Order.created_at >= today_start).all()
+    todays_orders = Order.query.filter(
+        Order.created_at >= today_start, Order.status != "cancelled"
+    ).all()
 
     revenue_today = round(sum(o.total for o in todays_orders), 2)
     pending_in_kitchen = Order.query.filter(
@@ -514,6 +569,7 @@ def custom_report():
             "group_by": group_by,
             "rows": rows,
             "totals": totals,
+            "cancelled": cancelled_summary(since, until),
         }
     )
 
@@ -564,11 +620,7 @@ def list_ingredients():
 @roles_required("admin")
 def low_stock():
     """Ingredients at or below their reorder level - feeds the notification bell."""
-    items = (
-        Ingredient.query.filter(Ingredient.stock_quantity <= Ingredient.reorder_level)
-        .order_by(Ingredient.name)
-        .all()
-    )
+    items = [i for i in Ingredient.query.order_by(Ingredient.name).all() if i.is_low()]
     return jsonify({"count": len(items), "items": [i.to_dict() for i in items]})
 
 
@@ -580,7 +632,7 @@ def create_ingredient():
         name=data.get("name"),
         unit=data.get("unit", "pcs"),
         stock_quantity=data.get("stock_quantity", 0),
-        reorder_level=data.get("reorder_level", 0),
+        reorder_level=data.get("reorder_level", LOW_STOCK_MINIMUM),
     )
     db.session.add(ingredient)
     db.session.commit()
@@ -625,7 +677,9 @@ def current_shift():
     if not shift:
         return jsonify(None)
 
-    orders_since = Order.query.filter(Order.created_at >= shift.opened_at).all()
+    orders_since = Order.query.filter(
+        Order.created_at >= shift.opened_at, Order.status != "cancelled"
+    ).all()
     cash_sales = round(sum(o.total for o in orders_since if o.payment_method == "cash"), 2)
     total_sales = round(sum(o.total for o in orders_since), 2)
 
@@ -672,7 +726,9 @@ def close_shift(shift_id):
     data = request.get_json() or {}
     counted_cash = float(data.get("counted_cash", 0))
 
-    orders_since = Order.query.filter(Order.created_at >= shift.opened_at).all()
+    orders_since = Order.query.filter(
+        Order.created_at >= shift.opened_at, Order.status != "cancelled"
+    ).all()
     cash_sales = sum(o.total for o in orders_since if o.payment_method == "cash")
     expected_cash = round(shift.opening_float + cash_sales, 2)
 

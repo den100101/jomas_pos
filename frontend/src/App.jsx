@@ -5,6 +5,7 @@ import Layout from "./components/Layout";
 import RequireRole from "./components/RequireRole";
 import Login from "./pages/Login";
 import POS from "./pages/POS";
+import Orders from "./pages/Orders";
 import Receipt from "./pages/Receipt";
 import Kitchen from "./pages/Kitchen";
 import Inventory from "./pages/Inventory";
@@ -42,15 +43,10 @@ function App() {
         <Routes>
           <Route path="/" element={<Navigate to={home} replace />} />
           <Route path="/pos" element={guard("pos", <POS />)} />
-          <Route
-            path="/receipt/:orderId"
-            element={guard("receipt", <Receipt />)}
-          />
+          <Route path="/orders" element={guard("orders", <Orders />)} />
+          <Route path="/receipt/:orderId" element={guard("receipt", <Receipt />)} />
           <Route path="/kitchen" element={guard("kitchen", <Kitchen />)} />
-          <Route
-            path="/inventory"
-            element={guard("inventory", <Inventory />)}
-          />
+          <Route path="/inventory" element={guard("inventory", <Inventory />)} />
           <Route path="/reports" element={guard("reports", <Reports />)} />
           <Route path="/shift" element={guard("shift", <Shift />)} />
           <Route path="/settings" element={guard("settings", <Settings />)} />

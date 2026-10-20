@@ -1,29 +1,45 @@
+import os
+from datetime import timedelta
+
 from flask_sqlalchemy import SQLAlchemy
- 
+
 from werkzeug.security import generate_password_hash, check_password_hash
- 
+
 USER_ROLES = ["admin", "cashier", "kitchen"]
+
+STORE_UTC_OFFSET_HOURS = int(os.environ.get("STORE_UTC_OFFSET_HOURS", "8"))
+STORE_UTC_OFFSET = timedelta(hours=STORE_UTC_OFFSET_HOURS)
+LOW_STOCK_MINIMUM = int(os.environ.get("LOW_STOCK_MINIMUM", "4"))
 
 db = SQLAlchemy()
 
 
+def shop_time(value):
+    """Turns a database (UTC) time into shop time with an explicit offset, e.g.
+    2026-09-27T01:30:00+08:00, so every screen shows the correct hour."""
+    if value is None:
+        return None
+    local = value + STORE_UTC_OFFSET
+    sign = "+" if STORE_UTC_OFFSET_HOURS >= 0 else "-"
+    return f"{local.isoformat()}{sign}{abs(STORE_UTC_OFFSET_HOURS):02d}:00"
+
 
 class User(db.Model):
     __tablename__ = "users"
- 
+
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), unique=True, nullable=False)
     name = db.Column(db.String(120), nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(20), nullable=False, default="cashier")
     is_active = db.Column(db.Boolean, nullable=False, default=True)
- 
+
     def set_password(self, raw_password):
         self.password_hash = generate_password_hash(raw_password)
- 
+
     def check_password(self, raw_password):
         return check_password_hash(self.password_hash, raw_password)
- 
+
     def to_dict(self):
         return {"id": self.id, "username": self.username, "name": self.name, "role": self.role}
 
@@ -72,7 +88,10 @@ class Ingredient(db.Model):
     name = db.Column(db.String(100), nullable=False)
     unit = db.Column(db.String(20), nullable=False, default="pcs")  # kg, g, l, ml, pcs...
     stock_quantity = db.Column(db.Float, nullable=False, default=0)
-    reorder_level = db.Column(db.Float, nullable=False, default=0)
+    reorder_level = db.Column(db.Float, nullable=False, default=LOW_STOCK_MINIMUM)
+
+    def is_low(self):
+        return self.stock_quantity <= max(self.reorder_level, LOW_STOCK_MINIMUM)
 
     def to_dict(self):
         return {
@@ -81,7 +100,7 @@ class Ingredient(db.Model):
             "unit": self.unit,
             "stock_quantity": self.stock_quantity,
             "reorder_level": self.reorder_level,
-            "low_stock": self.stock_quantity <= self.reorder_level,
+            "low_stock": self.is_low(),
         }
 
 
@@ -109,7 +128,7 @@ class ProductIngredient(db.Model):
 
 # ---------- Orders / kitchen / payments ----------
 
-ORDER_STATUSES = ["pending", "preparing", "ready", "completed"]
+ORDER_STATUSES = ["pending", "preparing", "ready", "completed"]  # "cancelled" is set only by the cancel route
 PAYMENT_METHODS = ["cash"]
 
 
@@ -127,6 +146,11 @@ class Order(db.Model):
     customer_email = db.Column(db.String(120), nullable=True)
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
+    # Filled in when an order is cancelled (added by migrate.py)
+    cancelled_at = db.Column(db.DateTime, nullable=True)
+    cancelled_by = db.Column(db.String(120), nullable=True)
+    cancel_reason = db.Column(db.String(255), nullable=True)
+
     items = db.relationship(
         "OrderItem", backref="order", lazy=True, cascade="all, delete-orphan"
     )
@@ -142,7 +166,10 @@ class Order(db.Model):
             "change": self.change,
             "status": self.status,
             "customer_email": self.customer_email,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": shop_time(self.created_at),
+            "cancelled_at": shop_time(self.cancelled_at),
+            "cancelled_by": self.cancelled_by,
+            "cancel_reason": self.cancel_reason,
             "items": [item.to_dict() for item in self.items],
         }
 
@@ -152,6 +179,7 @@ class OrderItem(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     order_id = db.Column(db.Integer, db.ForeignKey("orders.id"), nullable=False)
+    product_id = db.Column(db.Integer, nullable=True)  # added by migrate.py; used to restore stock
     product_name = db.Column(db.String(100), nullable=False)
     unit_price = db.Column(db.Float, nullable=False)
     quantity = db.Column(db.Integer, nullable=False)
@@ -190,8 +218,8 @@ class Shift(db.Model):
     def to_dict(self):
         return {
             "id": self.id,
-            "opened_at": self.opened_at.isoformat() if self.opened_at else None,
-            "closed_at": self.closed_at.isoformat() if self.closed_at else None,
+            "opened_at": shop_time(self.opened_at),
+            "closed_at": shop_time(self.closed_at),
             "opening_float": self.opening_float,
             "counted_cash": self.counted_cash,
             "expected_cash": self.expected_cash,
